@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "codex-retry"
+version = "0.1.0"
+description = "Automatically recover Codex threads from model-capacity errors"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = ["websockets>=15,<17"]
+
+[project.scripts]
+codex-retry = "codex_retry.cli:main"
+
+[project.urls]
+Repository = "https://github.com/ustas-eth/codex-retry"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/codex_retry"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
