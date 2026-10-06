@@ -7,7 +7,7 @@ import hashlib
 import json
 import math
 import os
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -66,9 +66,21 @@ def parser():
         "--timeout", type=positive_float, default=30, help="RPC deadline in seconds (default: 30)"
     )
     result.add_argument(
+        "--lookback-hours",
+        type=positive_float,
+        default=24,
+        help="discover non-archived saved threads updated within this many hours (default: 24)",
+    )
+    result.add_argument(
+        "--no-resume-blocked-goals",
+        action="store_false",
+        dest="resume_blocked_goals",
+        help="leave blocked goals stopped, even after a capacity failure",
+    )
+    result.add_argument(
         "--dry-run",
         action="store_true",
-        help="scan loaded threads once without loading or starting any",
+        help="scan candidates once without loading, changing goals, or starting turns",
     )
     result.add_argument("--json", action="store_true", help="emit JSON lines")
     result.add_argument("--version", action="version", version=f"codex-retry {__version__}")
@@ -92,7 +104,13 @@ def main(argv=None):
             )
 
     async def execute():
-        runner = Runner(delay=args.delay, max_retries=args.max_retries, emit=emit)
+        runner = Runner(
+            delay=args.delay,
+            max_retries=args.max_retries,
+            lookback_hours=args.lookback_hours,
+            resume_blocked_goals=args.resume_blocked_goals,
+            emit=emit,
+        )
         while True:
             try:
                 async with AppServer(args.endpoint, args.timeout) as app:
@@ -106,7 +124,7 @@ def main(argv=None):
                 await asyncio.sleep(5)
 
     try:
-        with controller_lock(args.endpoint):
+        with nullcontext() if args.dry_run else controller_lock(args.endpoint):
             return asyncio.run(execute())
     except KeyboardInterrupt:
         emit("stopped")

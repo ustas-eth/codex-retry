@@ -1,9 +1,14 @@
 # Development
 
 This is a slim server-wide runner for terminal model-capacity errors. Discover
-loaded threads, retry only matching failures, and leave other state alone.
-Keep it small: no orchestrator, model fallback, goal editing, prompt injection,
-transcript rewriting, or sweeping through saved historical conversations.
+loaded and recent non-archived threads, retry only matching failures, and leave
+other state alone. By default, restore a capacity-failed thread's blocked goal
+without replacing its objective or resetting its budget/counters. This is
+best effort: Codex's goal API does not expose the blocking cause. Keep the
+option to leave all blocked goals stopped consistent with dry-run reporting.
+Explicit pauses, completed goals, and limits remain stops.
+Keep it small: no orchestrator, model fallback, new assignments, prompt
+injection, transcript rewriting, or unbounded historical discovery.
 
 Read current app-server schemas before changing RPCs. Match terminal error
 metadata, not arbitrary conversation text. Recheck state before mutation, leave
