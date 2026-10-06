@@ -75,7 +75,7 @@ def parser():
         "--no-resume-blocked-goals",
         action="store_false",
         dest="resume_blocked_goals",
-        help="leave blocked goals stopped, even after a capacity failure",
+        help="retry failed turns without reactivating their blocked goals",
     )
     result.add_argument(
         "--dry-run",

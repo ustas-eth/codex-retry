@@ -37,8 +37,10 @@ codex-retry
 
 The runner covers loaded threads and non-archived saved threads updated in the
 last 24 hours. It can be started after a failure, including after the thread
-was unloaded or the server restarted. Notifications make it react promptly;
-a 30-second scan catches missed events and newly discovered work. It retries
+was unloaded or the server restarted. The time window limits discovery;
+once a failure is queued, it stays tracked until resolved or archived.
+Notifications make it react promptly; a 30-second scan catches missed events
+and newly discovered work. It retries
 after 5 seconds, then backs off to a maximum of 60 seconds until capacity returns.
 Optional controls:
 
@@ -67,13 +69,20 @@ Codex marks an active goal `blocked` when a turn ends in an error. If the latest
 turn failed at capacity, the runner restores that goal to `active` so normal
 goal-driven work continues, rather than merely starting one extra turn. It
 changes only the status: the assignment, budget, and accumulated usage are
-retained. Paused, completed, usage-limited, and budget-limited goals stay stopped.
+retained. Other goal statuses are preserved.
+
+Goal state and execution are separate: a turn can keep running after its goal
+is paused, completed, or limited. If that turn fails at capacity, the runner
+retries it with empty input without reactivating the goal. The latest terminal
+error determines eligibility, not goal status. This restores a chance to
+continue from existing context; the model decides what work remains.
 
 Goal recovery is best effort: Codex's goal API does not report why a goal was
 blocked. If an agent or controller deliberately blocks a goal and the latest
 turn fails at capacity, the runner may reactivate it too. Use
-`--no-resume-blocked-goals` to leave all blocked goals stopped. With the default
-policy, pause the goal or archive the thread when recovery should stop.
+`--no-resume-blocked-goals` to preserve blocked goal status while still retrying
+the failed turn. To stop capacity recovery, stop the runner or archive the
+thread; pausing a goal alone does not stop retries.
 
 Recovery loads a cold thread when necessary. Goal activation or loading can
 start work asynchronously; the runner confirms the new turn and does not send
@@ -83,9 +92,12 @@ configuration overrides. Cold loading follows Codex's own resume behavior and
 persisted settings; normal account limits and tool permissions still apply.
 Parent-owned v2 children may reject direct control.
 
-Ambiguous control results suspend retries for that exact failed turn; a later
-observed capacity failure can be retried. Rejected control, including native
-v2 ownership restrictions, is logged without looping on the same failure.
+Read failures defer recovery. Ambiguous control results suspend retries for
+that exact failed turn; a later observed capacity failure can be retried.
+An acknowledged retry whose new turn did not persist can be retried once the
+thread is unloaded. Stale history on a loaded thread is not enough to send a
+second start. Rejected control, including native v2 ownership restrictions,
+is logged without looping on the same failure.
 One local lock prevents duplicate runners on the same endpoint; other
 controllers can still race it. An optional retry limit applies per thread's
 capacity-failure episode. Retry state is kept in memory; restarting the runner
@@ -95,11 +107,13 @@ Ctrl+C stops the runner, not workers or their goals.
 Logs contain lifecycle events rather than conversation contents; `--json`
 emits one object per line. Run it in tmux or your service manager to keep it
 alive. `--dry-run` works beside an existing runner, exits after one read-only
-scan, and reports eligible retries, goal reactivation, and stopped goals under
-the selected policy. Current history uses a one-turn metadata read. Cold legacy
-histories may require a full read; very large histories can exceed the RPC
-timeout or 16 MiB response limit, in which case the failure is logged and left
-alone.
+scan, and reports eligible retries, current goal status, and planned goal
+reactivation under the selected policy. Current history uses a one-turn
+metadata read. Legacy histories require a full read, including idle threads:
+idle status alone does not prove success. Unchanged idle legacy reads are
+cached for up to 60 seconds and invalidated by thread notifications.
+Very large histories can exceed the RPC timeout or 16 MiB response limit, in
+which case the failure is logged and left alone.
 
 The [Codex app-server documentation](https://developers.openai.com/codex/app-server)
 describes server setup. Recovery semantics are adapted from
@@ -122,3 +136,5 @@ Native recovery is tested against Codex 0.159.1, including legacy and paginated
 history, loaded and cold threads, and goal continuation.
 The cold-goal test restarts the server after a capacity error and verifies
 discovery, sustained automatic turns, preserved usage, and eventual budget stop.
+Additional tests cover stopped goals, idle legacy failures, offline archiving,
+post-load read timeouts, and a fault-injected lost acceptance across a restart.

@@ -3,7 +3,7 @@ import copy
 import time
 import unittest
 
-from codex_retry.recovery import CAPACITY_MESSAGE, Snapshot, recover, snapshot
+from codex_retry.recovery import CAPACITY_MESSAGE, ControlStopped, Snapshot, recover, snapshot
 from codex_retry.rpc import RPCError
 from codex_retry.runner import Runner, loaded_threads, recent_threads
 
@@ -61,6 +61,7 @@ class FakeApp:
                 "thread": {
                     "status": {"type": thread["status"]},
                     "historyMode": thread.get("historyMode", "paginated"),
+                    "updatedAt": thread.get("updatedAt"),
                     "turns": [copy.deepcopy(thread["turn"])] if params.get("includeTurns") else [],
                 }
             }
@@ -132,10 +133,14 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_inactive_goals_are_not_reactivated(self):
         for status in ["paused", "complete", "budgetLimited", "usageLimited", "unknown"]:
-            self.app.threads["one"]["goal"] = {"status": status}
-            result = await recover(self.app, "one", "old")
-            self.assertEqual(result["outcome"], "inactiveGoal")
-        self.assertNotIn("turn/start", [method for method, _ in self.app.calls])
+            with self.subTest(status=status):
+                objective = {"status": status, "objective": "Fixture", "tokensUsed": 123}
+                self.app.threads["one"].update(turn=failed(), goal=objective.copy())
+                result = await recover(self.app, "one", "old")
+                self.assertEqual(result["outcome"], "started")
+                self.assertEqual(self.app.threads["one"]["goal"], objective)
+        self.assertEqual([method for method, _ in self.app.calls].count("turn/start"), 5)
+        self.assertNotIn("thread/goal/set", [method for method, _ in self.app.calls])
 
     async def test_capacity_blocked_goal_restores_continuation_without_resetting_budget(self):
         objective = {
@@ -168,17 +173,17 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_disabled_goal_recovery_leaves_loaded_and_cold_blocked_goals_untouched(self):
         for status in ["systemError", "notLoaded"]:
             with self.subTest(status=status):
-                self.app.threads["one"].update(status=status, goal={"status": "blocked"})
+                self.app.threads["one"].update(
+                    status=status, turn=failed(), goal={"status": "blocked"}
+                )
                 self.app.calls.clear()
                 result = await recover(self.app, "one", "old", resume_blocked_goals=False)
-                self.assertEqual(result, {"outcome": "inactiveGoal", "goalStatus": "blocked"})
+                self.assertEqual(result, {"outcome": "started", "turnId": "new"})
                 self.assertEqual(self.app.threads["one"]["goal"], {"status": "blocked"})
-                self.assertFalse(
-                    any(
-                        method in {"thread/resume", "thread/goal/set", "turn/start"}
-                        for method, _ in self.app.calls
-                    )
-                )
+                methods = [method for method, _ in self.app.calls]
+                self.assertNotIn("thread/goal/set", methods)
+                self.assertEqual(methods.count("turn/start"), 1)
+                self.assertEqual(methods.count("thread/resume"), int(status == "notLoaded"))
 
     async def test_disabled_goal_recovery_still_retries_active_and_no_goal_threads(self):
         for objective in [None, {"status": "active"}]:
@@ -287,7 +292,7 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.app.calls[-1][1]["itemsView"], "notLoaded")
         self.assertEqual(self.app.calls[-1][1]["limit"], 1)
 
-    async def test_legacy_failure_falls_back_but_healthy_history_is_not_hydrated(self):
+    async def test_legacy_failure_is_recognized_even_when_idle(self):
         self.app.threads["one"]["historyMode"] = "legacy"
         original = self.app.request
 
@@ -303,8 +308,79 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         )
         self.app.calls.clear()
         self.app.threads["one"]["status"] = "idle"
-        self.assertIsNone((await snapshot(self.app, "one")).turn)
-        self.assertEqual(len(self.app.calls), 1)
+        self.assertTrue((await snapshot(self.app, "one")).capacity_failed)
+        self.assertTrue(any(params.get("includeTurns") for _, params in self.app.calls))
+
+    async def test_legacy_cache_reuses_a_read_not_an_assumed_healthy_status(self):
+        self.app.threads["one"].update(status="idle", historyMode="legacy", updatedAt=1)
+        original = self.app.request
+
+        async def request(method, params):
+            if method == "thread/turns/list":
+                raise RPCError({"code": -32601, "message": "unsupported"})
+            return await original(method, params)
+
+        self.app.request = request
+        cache = {}
+        self.assertTrue((await snapshot(self.app, "one", legacy_cache=cache)).capacity_failed)
+        self.app.calls.clear()
+        self.assertTrue((await snapshot(self.app, "one", legacy_cache=cache)).capacity_failed)
+        self.assertEqual(
+            self.app.calls, [("thread/read", {"threadId": "one", "includeTurns": False})]
+        )
+        self.app.threads["one"].update(turn=self.app.next_turn, updatedAt=2)
+        self.assertFalse((await snapshot(self.app, "one", legacy_cache=cache)).capacity_failed)
+        stamp, _, cached = cache["one"]
+        cache["one"] = (stamp, 0, cached)
+        self.app.calls.clear()
+        await snapshot(self.app, "one", legacy_cache=cache)
+        self.assertTrue(any(params.get("includeTurns") for _, params in self.app.calls))
+
+    async def test_goal_activation_clamped_by_budget_still_retries_execution(self):
+        self.app.threads["one"]["goal"] = {"status": "blocked", "tokensUsed": 50}
+        self.app.goal_continues = False
+        original = self.app.request
+
+        async def request(method, params):
+            result = await original(method, params)
+            if method == "thread/goal/set":
+                self.app.threads["one"]["goal"]["status"] = "budgetLimited"
+                result["goal"]["status"] = "budgetLimited"
+            return result
+
+        self.app.request = request
+        self.assertEqual((await recover(self.app, "one", "old"))["outcome"], "started")
+        self.assertEqual(
+            self.app.threads["one"]["goal"], {"status": "budgetLimited", "tokensUsed": 50}
+        )
+
+    async def test_final_preflight_leaves_a_newly_active_thread_alone(self):
+        original = self.app.request
+
+        async def request(method, params):
+            result = await original(method, params)
+            if method == "thread/goal/get":
+                self.app.threads["one"]["status"] = "active"
+            return result
+
+        self.app.request = request
+        self.assertEqual((await recover(self.app, "one", "old"))["outcome"], "changed")
+        self.assertNotIn("turn/start", [method for method, _ in self.app.calls])
+
+    async def test_malformed_start_acknowledgement_is_quarantined(self):
+        original = self.app.request
+
+        for turn in [None, {}, {"id": ""}, {"id": "old"}]:
+
+            async def request(method, params):
+                if method == "turn/start":
+                    return {"turn": turn}
+                return await original(method, params)
+
+            with self.subTest(turn=turn):
+                self.app.request = request
+                with self.assertRaises(ControlStopped):
+                    await recover(self.app, "one", "old")
 
     async def test_unrelated_history_error_never_falls_back(self):
         original = self.app.request
@@ -347,10 +423,12 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([method for method, _ in self.app.calls].count("turn/start"), 1)
         self.assertFalse(self.runner.retries)
 
-    async def test_dry_run_does_not_claim_paused_goals_would_retry(self):
+    async def test_dry_run_retries_execution_while_preserving_paused_goals(self):
         self.app.threads["one"]["goal"] = {"status": "paused"}
         await self.runner.serve(self.app, dry_run=True)
-        self.assertEqual([event for event, _ in self.events], ["inactiveGoal"])
+        self.assertEqual([event for event, _ in self.events], ["wouldRetry"])
+        self.assertEqual(self.events[-1][1]["goalStatus"], "paused")
+        self.assertIsNone(self.events[-1][1]["goalAction"])
         self.assertFalse(
             any(method in {"turn/start", "thread/resume"} for method, _ in self.app.calls)
         )
@@ -363,10 +441,9 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         self.runner.resume_blocked_goals = False
         self.events.clear()
         await self.runner.serve(self.app, dry_run=True)
-        self.assertEqual(
-            self.events,
-            [("inactiveGoal", {"threadId": "one", "goalStatus": "blocked"})],
-        )
+        self.assertEqual(self.events[-1][0], "wouldRetry")
+        self.assertEqual(self.events[-1][1]["goalStatus"], "blocked")
+        self.assertIsNone(self.events[-1][1]["goalAction"])
         self.assertFalse(
             any(
                 method in {"thread/resume", "turn/start", "thread/goal/set"}
@@ -374,7 +451,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-    async def test_disabled_goal_recovery_keeps_blocked_work_stopped_without_log_spam(self):
+    async def test_disabled_goal_recovery_retries_once_without_reactivating_goal(self):
         self.runner = Runner(
             delay=0.001,
             resume_blocked_goals=False,
@@ -382,15 +459,11 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.app.threads["one"].update(status="notLoaded", goal={"status": "blocked"})
         await self.trigger()
-        self.runner.retries["one"].due = 0
         await self.runner.inspect(self.app, "one")
-        self.assertEqual([event for event, _ in self.events].count("inactiveGoal"), 1)
-        self.assertFalse(
-            any(
-                method in {"thread/resume", "turn/start", "thread/goal/set"}
-                for method, _ in self.app.calls
-            )
-        )
+        self.assertEqual(self.app.threads["one"]["goal"]["status"], "blocked")
+        methods = [method for method, _ in self.app.calls]
+        self.assertEqual(methods.count("turn/start"), 1)
+        self.assertNotIn("thread/goal/set", methods)
 
     async def test_repeated_failures_back_off_and_limit_is_per_episode(self):
         self.runner.max_retries = 2
@@ -432,6 +505,69 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         for _ in range(3):
             await self.runner.inspect(self.app, "one")
         self.assertEqual([method for method, _ in self.app.calls].count("turn/start"), 1)
+
+    async def test_accepted_unpersisted_start_retries_only_after_thread_is_unloaded(self):
+        original = self.app.request
+
+        async def request(method, params):
+            result = await original(method, params)
+            if method == "turn/start":
+                self.app.threads["one"]["turn"] = failed()
+            return result
+
+        self.app.request = request
+        await self.trigger()
+        self.assertTrue(self.runner.retries["one"].accepted)
+        for _ in range(3):
+            await self.runner.inspect(self.app, "one")
+        self.assertEqual([method for method, _ in self.app.calls].count("turn/start"), 1)
+        self.app.threads["one"]["status"] = "notLoaded"
+        self.app.request = original
+        await self.runner.inspect(self.app, "one")
+        self.assertIsNone(self.runner.retries["one"].submitted)
+        self.assertIn("retryLost", [event for event, _ in self.events])
+        self.runner.retries["one"].due = 0
+        await self.runner.inspect(self.app, "one")
+        self.assertEqual([method for method, _ in self.app.calls].count("turn/start"), 2)
+
+    async def test_unconfirmed_acknowledged_continuation_can_reconcile_after_unload(self):
+        self.app.threads["one"]["goal"] = {"status": "blocked"}
+        self.app.goal_continues = False
+        await self.trigger()
+        pending = self.runner.retries["one"]
+        self.assertTrue(pending.blocked)
+        self.assertTrue(pending.accepted)
+        self.assertEqual(pending.attempts, 1)
+        await self.runner.inspect(self.app, "one")
+        self.assertNotIn("turn/start", [method for method, _ in self.app.calls])
+        self.app.threads["one"]["status"] = "notLoaded"
+        self.app.resume_continues = True
+        await self.runner.inspect(self.app, "one")
+        self.assertFalse(pending.blocked)
+        pending.due = 0
+        await self.runner.inspect(self.app, "one")
+        self.assertEqual([method for method, _ in self.app.calls].count("thread/resume"), 1)
+        self.assertEqual(pending.submitted, "new")
+        self.assertNotIn("turn/start", [method for method, _ in self.app.calls])
+
+    async def test_unloaded_retry_reconciliation_does_not_reset_retry_limit(self):
+        self.runner.max_retries = 1
+        await self.trigger()
+        self.app.threads["one"].update(status="notLoaded", turn=failed())
+        await self.runner.inspect(self.app, "one")
+        self.runner.retries["one"].due = 0
+        await self.runner.inspect(self.app, "one")
+        self.assertEqual(self.events[-1][0], "exhausted")
+        self.assertEqual([method for method, _ in self.app.calls].count("turn/start"), 1)
+
+    async def test_unknown_submission_stays_quarantined_even_after_unload(self):
+        self.app.start_error = TimeoutError("lost acknowledgement")
+        await self.trigger()
+        self.app.threads["one"]["status"] = "notLoaded"
+        self.app.start_error = None
+        await self.runner.inspect(self.app, "one")
+        self.assertTrue(self.runner.retries["one"].blocked)
+        self.assertNotIn("thread/resume", [method for method, _ in self.app.calls])
 
     async def test_unsettled_history_does_not_clear_retry_episode(self):
         await self.trigger()
@@ -520,6 +656,122 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         self.runner.retries["one"].due = 0
         await self.runner.inspect(self.app, "one")
         self.assertEqual([method for method, _ in self.app.calls].count("thread/goal/set"), 1)
+
+    async def test_read_error_after_acknowledged_cold_load_defers_not_quarantines(self):
+        for objective in [None, {"status": "paused"}, {"status": "blocked"}]:
+            with self.subTest(goal=objective):
+                self.app = FakeApp()
+                self.runner = Runner(delay=0.001)
+                self.app.threads["one"].update(status="notLoaded", goal=copy.deepcopy(objective))
+                original = self.app.request
+                loaded = False
+
+                async def request(method, params):
+                    nonlocal loaded
+                    if method == "thread/goal/get" and loaded:
+                        raise TimeoutError("read after successful load timed out")
+                    result = await original(method, params)
+                    if method == "thread/resume":
+                        loaded = True
+                    return result
+
+                self.app.request = request
+                await self.trigger()
+                self.assertFalse(self.runner.retries["one"].blocked)
+                self.assertNotIn("turn/start", [method for method, _ in self.app.calls])
+                self.app.request = original
+                self.runner.retries["one"].due = 0
+                await self.runner.inspect(self.app, "one")
+                methods = [method for method, _ in self.app.calls]
+                self.assertEqual(methods.count("thread/resume"), 1)
+                self.assertEqual(
+                    methods.count("turn/start"), int(objective != {"status": "blocked"})
+                )
+                self.assertIsNotNone(self.runner.retries["one"].submitted)
+
+    async def test_cache_is_invalidated_by_notifications_and_reconnection(self):
+        self.app.threads["one"].update(
+            status="idle", historyMode="legacy", updatedAt=1, turn=self.app.next_turn
+        )
+        original = self.app.request
+
+        async def request(method, params):
+            if method == "thread/turns/list":
+                raise RPCError({"code": -32601, "message": "unsupported"})
+            return await original(method, params)
+
+        self.app.request = request
+        task = asyncio.create_task(self.runner.serve(self.app, scan_interval=0.01))
+        try:
+            for _ in range(100):
+                if "one" in self.runner.legacy_cache:
+                    break
+                await asyncio.sleep(0.005)
+            self.assertIn("one", self.runner.legacy_cache)
+            self.app.threads["one"]["turn"] = failed()
+            self.app.dirty.add("one")
+            self.app.changed.set()
+            # This shares timestamp 1 with the cached healthy read. A notice
+            # must invalidate it even when metadata cannot show the change yet.
+            for _ in range(100):
+                if any(method == "turn/start" for method, _ in self.app.calls):
+                    break
+                await asyncio.sleep(0.005)
+            self.assertTrue(any(method == "turn/start" for method, _ in self.app.calls))
+        finally:
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        self.app.threads["one"]["turn"] = self.app.next_turn
+        self.runner.retries.clear()
+        await self.runner.inspect(self.app, "one")
+        self.assertIn("one", self.runner.legacy_cache)
+        self.app.calls.clear()
+        await self.runner.serve(self.app, dry_run=True)
+        self.assertTrue(any(params.get("includeTurns") for _, params in self.app.calls))
+
+    async def test_explicit_scope_loss_drops_pending_retry_without_controls(self):
+        await self.runner.inspect(self.app, "one")
+        self.runner.retries["one"].due = 0
+        original = self.app.request
+
+        async def request(method, params):
+            if method == "thread/goal/get":
+                raise RPCError({"code": -32600, "message": "thread not found: one"})
+            return await original(method, params)
+
+        self.app.request = request
+        await self.runner.inspect(self.app, "one")
+        self.assertNotIn("one", self.runner.retries)
+        self.assertEqual(self.events[-1][0], "outOfScope")
+        self.assertNotIn("turn/start", [method for method, _ in self.app.calls])
+
+    async def test_discovery_age_does_not_remove_a_known_pending_retry(self):
+        self.runner.delay = 100
+        self.app.threads["one"].update(status="notLoaded", updatedAt=time.time())
+        task = asyncio.create_task(self.runner.serve(self.app, scan_interval=0.01))
+        try:
+            for _ in range(100):
+                if "one" in self.runner.retries:
+                    break
+                await asyncio.sleep(0.005)
+            pending = self.runner.retries["one"]
+            self.app.threads["one"]["updatedAt"] = time.time() - 90000
+            # Wait through multiple scans while this is no longer discoverable.
+            await asyncio.sleep(0.05)
+            self.assertIs(self.runner.retries.get("one"), pending)
+            pending.due = 0
+            self.app.changed.set()
+            for _ in range(100):
+                if any(method == "turn/start" for method, _ in self.app.calls):
+                    break
+                await asyncio.sleep(0.005)
+            self.assertEqual([method for method, _ in self.app.calls].count("turn/start"), 1)
+        finally:
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
 
     async def test_newly_loaded_thread_is_discovered(self):
         task = asyncio.create_task(self.runner.serve(self.app, scan_interval=0.01))
