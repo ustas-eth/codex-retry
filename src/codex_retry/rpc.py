@@ -35,6 +35,7 @@ class AppServer:
         self.ws = self.reader = None
         self.changed = asyncio.Event()
         self.dirty = set()
+        self.archived = set()
 
     async def __aenter__(self):
         options = dict(compression=None, max_size=16 * 1024 * 1024, open_timeout=self.timeout)
@@ -82,9 +83,18 @@ class AppServer:
                     raise RuntimeError("app-server returned a non-object message")
                 if "method" in message:
                     # Leave UI/approval requests to the operator's client.
-                    if message["method"] == "thread/status/changed":
+                    if message["method"] in {
+                        "thread/status/changed",
+                        "thread/goal/updated",
+                        "thread/archived",
+                        "thread/unarchived",
+                    }:
                         thread_id = message.get("params", {}).get("threadId")
                         if isinstance(thread_id, str):
+                            if message["method"] == "thread/archived":
+                                self.archived.add(thread_id)
+                            elif message["method"] == "thread/unarchived":
+                                self.archived.discard(thread_id)
                             self.dirty.add(thread_id)
                             self.changed.set()
                     continue

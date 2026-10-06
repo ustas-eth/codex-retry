@@ -9,8 +9,9 @@ from unittest.mock import patch
 
 from websockets.asyncio.server import serve
 
-from codex_retry.cli import controller_lock, parser
+from codex_retry.cli import controller_lock, main, parser
 from codex_retry.rpc import AppServer, RPCError, unix_path
+from codex_retry.runner import Runner
 
 
 class RPCTests(unittest.IsolatedAsyncioTestCase):
@@ -65,11 +66,44 @@ class RPCTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CLITests(unittest.TestCase):
+    def test_dry_run_does_not_take_the_running_controllers_lock(self):
+        class EmptyServer:
+            async def __aenter__(self):
+                self.reader = asyncio.get_running_loop().create_future()
+                self.dirty, self.archived = set(), set()
+                self.changed = asyncio.Event()
+                return self
+
+            async def __aexit__(self, *_):
+                pass
+
+            async def request(self, method, params):
+                if method not in {"thread/list", "thread/loaded/list"}:
+                    raise AssertionError(method)
+                return {"data": [], "nextCursor": None}
+
+        for options, resume in [([], True), (["--no-resume-blocked-goals"], False)]:
+            with (
+                self.subTest(resume_blocked_goals=resume),
+                patch("codex_retry.cli.controller_lock") as lock,
+                patch("codex_retry.cli.AppServer", return_value=EmptyServer()),
+                patch("codex_retry.cli.Runner", wraps=Runner) as runner,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(main(["--dry-run", *options]), 0)
+                lock.assert_not_called()
+                self.assertEqual(runner.call_args.kwargs["resume_blocked_goals"], resume)
+
     def test_server_wide_default_and_validation(self):
         self.assertEqual(parser().parse_args([]).delay, 5)
+        self.assertEqual(parser().parse_args([]).lookback_hours, 24)
+        self.assertTrue(parser().parse_args([]).resume_blocked_goals)
+        self.assertFalse(parser().parse_args(["--no-resume-blocked-goals"]).resume_blocked_goals)
         for value in ["0", "-1", "nan", "inf"]:
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 parser().parse_args(["--delay", value])
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                parser().parse_args(["--lookback-hours", value])
 
     def test_lock_is_server_scoped_and_releases(self):
         with (

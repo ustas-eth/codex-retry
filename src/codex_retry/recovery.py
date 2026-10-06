@@ -90,7 +90,27 @@ async def goal(app, thread_id):
     return value
 
 
-async def recover(app, thread_id, expected_turn):
+def retryable_goal(objective, resume_blocked_goals):
+    return (
+        objective is None
+        or objective["status"] == "active"
+        or (resume_blocked_goals and objective["status"] == "blocked")
+    )
+
+
+async def continuation(app, thread_id, expected_turn):
+    """Goal activation/resume can start a turn asynchronously; don't start twice."""
+    deadline = asyncio.get_running_loop().time() + app.timeout
+    while True:
+        resumed = await snapshot(app, thread_id, active_turn=True, inspect_idle=True)
+        if resumed.turn_id is not None and resumed.turn_id != expected_turn:
+            return {"outcome": "resumed", "turnId": resumed.turn_id}
+        if asyncio.get_running_loop().time() >= deadline:
+            raise RuntimeError("goal continuation is unconfirmed; inspect before retrying")
+        await asyncio.sleep(0.1)
+
+
+async def recover(app, thread_id, expected_turn, *, resume_blocked_goals=True):
     """Recheck before mutation. Never retry an uncertain mutation automatically."""
     current = await snapshot(app, thread_id, inspect_idle=True)
     if (
@@ -100,37 +120,60 @@ async def recover(app, thread_id, expected_turn):
     ):
         return {"outcome": "changed"}
     objective = await goal(app, thread_id)
-    if objective and objective["status"] not in {"active", "blocked"}:
+    if not retryable_goal(objective, resume_blocked_goals):
         return {"outcome": "inactiveGoal", "goalStatus": objective["status"]}
+    control_sent = False
     try:
         if current.status == "notLoaded":
+            control_sent = True
             await app.request("thread/resume", {"threadId": thread_id, "excludeTurns": True})
             # Cold loading can continue a goal asynchronously, including a very fast failure.
             after_goal = await goal(app, thread_id)
             if (objective and objective["status"] == "active") or (
                 after_goal and after_goal["status"] == "active"
             ):
-                deadline = asyncio.get_running_loop().time() + app.timeout
-                while True:
-                    resumed = await snapshot(app, thread_id, active_turn=True, inspect_idle=True)
-                    if resumed.turn_id is not None and resumed.turn_id != expected_turn:
-                        return {"outcome": "resumed", "turnId": resumed.turn_id}
-                    if asyncio.get_running_loop().time() >= deadline:
-                        raise RuntimeError(
-                            "goal continuation is unconfirmed after loading; inspect before retrying"
-                        )
-                    await asyncio.sleep(0.1)
-            if after_goal and after_goal["status"] not in {"active", "blocked"}:
+                return await continuation(app, thread_id, expected_turn)
+            if not retryable_goal(after_goal, resume_blocked_goals):
                 return {"outcome": "inactiveGoal", "goalStatus": after_goal["status"]}
             current = await snapshot(app, thread_id, inspect_idle=True)
             if current.status == "active" or current.turn_id != expected_turn:
                 return {"outcome": "changed"}
+            if objective != after_goal:
+                return {"outcome": "changed"}
+        # Best effort: the API does not retain why a goal was blocked. Reactivate
+        # it after the latest capacity failure unless the caller disables this.
+        # An empty turn alone would leave native goal continuation stopped.
+        if objective and objective["status"] == "blocked":
+            latest_goal = await goal(app, thread_id)
+            latest = await snapshot(app, thread_id, inspect_idle=True)
+            if (
+                latest_goal != objective
+                or latest.status == "active"
+                or latest.turn_id != expected_turn
+            ):
+                return {"outcome": "changed"}
+            if not latest.capacity_failed:
+                return {"outcome": "changed"}
+            control_sent = True
+            updated = await app.request(
+                "thread/goal/set", {"threadId": thread_id, "status": "active"}
+            )
+            updated_goal = updated.get("goal")
+            if not isinstance(updated_goal, dict):
+                raise RuntimeError("goal activation is unconfirmed; inspect before retrying")
+            if updated_goal.get("status") != "active":
+                return {"outcome": "inactiveGoal", "goalStatus": updated_goal.get("status")}
+            result = await continuation(app, thread_id, expected_turn)
+            return result | {"goalResumed": True}
         if current.status not in {"idle", "systemError"}:
             raise RuntimeError(f"thread cannot accept an empty turn: {current.status}")
+        control_sent = True
         result = await app.request("turn/start", {"threadId": thread_id, "input": []})
         turn_id = result.get("turn", {}).get("id")
         if not isinstance(turn_id, str) or not turn_id:
             raise RuntimeError("turn/start acceptance is unconfirmed; inspect before retrying")
         return {"outcome": "started", "turnId": turn_id}
     except Exception as exc:
-        raise ControlStopped(str(exc)) from exc
+        if control_sent:
+            raise ControlStopped(str(exc)) from exc
+        raise

@@ -23,7 +23,7 @@ class Model(BaseHTTPRequestHandler):
         self.server.requests.append(
             json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         )
-        if len(self.server.requests) == 1:
+        if len(self.server.requests) in self.server.fail_at:
             events = [
                 {
                     "type": "response.failed",
@@ -35,6 +35,27 @@ class Model(BaseHTTPRequestHandler):
                         },
                     },
                 }
+            ]
+        elif len(self.server.requests) in getattr(self.server, "block_at", set()):
+            events = [
+                {"type": "response.created", "response": {"id": "synthetic-agent-block"}},
+                {
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "function_call",
+                        "id": "synthetic-goal-tool",
+                        "call_id": "synthetic-goal-call",
+                        "name": "update_goal",
+                        "arguments": '{"status":"blocked"}',
+                    },
+                },
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "synthetic-agent-block",
+                        "usage": {"input_tokens": 10, "output_tokens": 1, "total_tokens": 11},
+                    },
+                },
             ]
         else:
             events = [
@@ -116,6 +137,7 @@ class NativeTests(unittest.IsolatedAsyncioTestCase):
         self.home = Path(self.directory.name)
         self.backend = ThreadingHTTPServer(("127.0.0.1", 0), Model)
         self.backend.requests = []
+        self.backend.fail_at = {1}
         self.serving = threading.Thread(target=self.backend.serve_forever, daemon=True)
         self.serving.start()
         (self.home / "config.toml").write_text(
@@ -152,7 +174,7 @@ class NativeTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.05)
         self.fail("synthetic turn did not settle")
 
-    async def create_failed(self, app, *, goal=False, history_mode="paginated"):
+    async def create_failed(self, app, *, goal=False, budget=1000000, history_mode="paginated"):
         result = await app.request(
             "thread/start",
             {
@@ -165,7 +187,7 @@ class NativeTests(unittest.IsolatedAsyncioTestCase):
         if goal:
             await app.request(
                 "thread/goal/set",
-                {"threadId": thread_id, "objective": "Return OK.", "tokenBudget": 1000000},
+                {"threadId": thread_id, "objective": "Return OK.", "tokenBudget": budget},
             )
         else:
             await app.request(
@@ -175,9 +197,12 @@ class NativeTests(unittest.IsolatedAsyncioTestCase):
                     "input": [{"type": "text", "text": "Synthetic fixture. Reply OK."}],
                 },
             )
-        current = await self.terminal(app, thread_id)
-        self.assertTrue(current.capacity_failed, current)
-        return thread_id, current.turn_id
+        for _ in range(200):
+            current = await self.terminal(app, thread_id)
+            if current.capacity_failed:
+                return thread_id, current.turn_id
+            await asyncio.sleep(0.05)
+        self.fail(f"synthetic capacity error was not observed: {current}")
 
     async def test_server_wide_runner_recovers_without_new_user_input(self):
         async with Native(self.home) as server, AppServer(f"unix://{server.socket}") as app:
@@ -209,18 +234,150 @@ class NativeTests(unittest.IsolatedAsyncioTestCase):
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
 
-    async def test_cold_blocked_goal_is_woken_once_without_goal_editing(self):
+    async def test_cold_blocked_goal_restores_sustained_work_through_saved_discovery(self):
+        self.backend.fail_at = {2}
         async with Native(self.home) as server, AppServer(f"unix://{server.socket}") as app:
-            thread_id, old = await self.create_failed(app, goal=True)
+            thread_id, _ = await self.create_failed(app, goal=True, budget=40)
+            before = (await app.request("thread/goal/get", {"threadId": thread_id}))["goal"]
+            self.assertEqual(before["status"], "blocked")
+            self.assertEqual(before["tokensUsed"], 11)
         async with Native(self.home) as server, AppServer(f"unix://{server.socket}") as app:
             self.assertEqual((await snapshot(app, thread_id)).status, "notLoaded")
+            commands = []
+            original_request = app.request
+
+            async def recorded_request(method, params):
+                if method in {"thread/resume", "thread/goal/set", "turn/start"}:
+                    commands.append((method, params.copy()))
+                return await original_request(method, params)
+
+            app.request = recorded_request
+            runner = Runner(delay=0.01)
+            task = asyncio.create_task(runner.serve(app, scan_interval=0.05))
+            try:
+                for _ in range(200):
+                    objective = (await app.request("thread/goal/get", {"threadId": thread_id}))[
+                        "goal"
+                    ]
+                    if objective["status"] == "budgetLimited":
+                        break
+                    await asyncio.sleep(0.05)
+                self.assertEqual(objective["status"], "budgetLimited")
+                self.assertEqual(objective["objective"], before["objective"])
+                self.assertEqual(objective["tokenBudget"], 40)
+                self.assertEqual(objective["tokensUsed"], before["tokensUsed"] + 33)
+                self.assertEqual(objective["createdAt"], before["createdAt"])
+                self.assertGreaterEqual(objective["timeUsedSeconds"], before["timeUsedSeconds"])
+                self.assertEqual(len(self.backend.requests), 5)
+                # Native goal reminders change between turns. Verify our actual
+                # control requests rather than mistaking those for user input.
+                self.assertEqual(
+                    commands,
+                    [
+                        ("thread/resume", {"threadId": thread_id, "excludeTurns": True}),
+                        ("thread/goal/set", {"threadId": thread_id, "status": "active"}),
+                    ],
+                )
+            finally:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+    async def test_loaded_blocked_goal_reactivation_starts_only_one_turn(self):
+        async with Native(self.home) as server, AppServer(f"unix://{server.socket}") as app:
+            thread_id, old = await self.create_failed(app, goal=True, budget=1)
             result = await recover(app, thread_id, old)
-            self.assertEqual(result["outcome"], "started")
+            self.assertTrue(result["goalResumed"])
             final = await self.terminal(app, thread_id)
             self.assertEqual(final.turn["status"], "completed")
             self.assertEqual(len(self.backend.requests), 2)
-            objective = await app.request("thread/goal/get", {"threadId": thread_id})
-            self.assertEqual(objective["goal"]["status"], "blocked")
+
+    async def agent_block_then_capacity(self, app):
+        self.backend.block_at, self.backend.fail_at = {1}, {2}
+        thread_id, old = await self.create_failed(app, goal=True, budget=22)
+        outputs = [
+            item["output"]
+            for item in self.backend.requests[1]["input"]
+            if item.get("type") == "function_call_output"
+            and item.get("call_id") == "synthetic-goal-call"
+        ]
+        self.assertEqual(len(outputs), 1)
+        self.assertEqual(json.loads(outputs[0])["goal"]["status"], "blocked")
+        return thread_id, old
+
+    async def test_best_effort_default_resumes_agent_block_followed_by_capacity_failure(self):
+        async with Native(self.home) as server, AppServer(f"unix://{server.socket}") as app:
+            thread_id, old = await self.agent_block_then_capacity(app)
+            self.assertTrue((await recover(app, thread_id, old))["goalResumed"])
+            final = await self.terminal(app, thread_id)
+            self.assertEqual(final.turn["status"], "completed")
+            self.assertEqual(len(self.backend.requests), 3)
+
+    async def test_disabled_goal_recovery_preserves_agent_block_after_restart(self):
+        async with Native(self.home) as server, AppServer(f"unix://{server.socket}") as app:
+            thread_id, old = await self.agent_block_then_capacity(app)
+            before = (await app.request("thread/goal/get", {"threadId": thread_id}))["goal"]
+            result = await recover(app, thread_id, old, resume_blocked_goals=False)
+            self.assertEqual(result, {"outcome": "inactiveGoal", "goalStatus": "blocked"})
+        async with Native(self.home) as server, AppServer(f"unix://{server.socket}") as app:
+            events = []
+            runner = Runner(
+                delay=0.001,
+                resume_blocked_goals=False,
+                emit=lambda event, **fields: events.append((event, fields)),
+            )
+            await runner.serve(app, dry_run=True)
+            self.assertEqual(
+                events, [("inactiveGoal", {"threadId": thread_id, "goalStatus": "blocked"})]
+            )
+            result = await recover(app, thread_id, old, resume_blocked_goals=False)
+            self.assertEqual(result, {"outcome": "inactiveGoal", "goalStatus": "blocked"})
+            self.assertEqual((await snapshot(app, thread_id)).status, "notLoaded")
+            after = (await app.request("thread/goal/get", {"threadId": thread_id}))["goal"]
+            self.assertEqual(after, before)
+            self.assertEqual(len(self.backend.requests), 2)
+
+    async def test_goal_retries_repeated_capacity_failures_until_service_recovers(self):
+        self.backend.fail_at = {1, 2}
+        async with Native(self.home) as server, AppServer(f"unix://{server.socket}") as app:
+            thread_id, _ = await self.create_failed(app, goal=True, budget=1)
+            events = []
+            runner = Runner(delay=0.01, emit=lambda event, **fields: events.append((event, fields)))
+            task = asyncio.create_task(runner.serve(app, scan_interval=0.05))
+            try:
+                for _ in range(200):
+                    objective = (await app.request("thread/goal/get", {"threadId": thread_id}))[
+                        "goal"
+                    ]
+                    if objective["status"] == "budgetLimited":
+                        break
+                    await asyncio.sleep(0.05)
+                self.assertEqual(objective["status"], "budgetLimited")
+                self.assertEqual(len(self.backend.requests), 3)
+                resumed = [fields for event, fields in events if event == "resumed"]
+                self.assertEqual(len(resumed), 2)
+                self.assertTrue(all(fields["goalResumed"] for fields in resumed))
+            finally:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+    async def test_explicitly_paused_and_archived_failed_threads_are_not_recovered(self):
+        async with Native(self.home) as server, AppServer(f"unix://{server.socket}") as app:
+            thread_id, _ = await self.create_failed(app, goal=True)
+            await app.request("thread/goal/set", {"threadId": thread_id, "status": "paused"})
+        async with Native(self.home) as server, AppServer(f"unix://{server.socket}") as app:
+            events = []
+            runner = Runner(emit=lambda event, **fields: events.append((event, fields)))
+            await runner.serve(app, dry_run=True)
+            self.assertIn("inactiveGoal", [event for event, _ in events])
+            self.assertEqual((await snapshot(app, thread_id)).status, "notLoaded")
+            self.assertEqual(len(self.backend.requests), 1)
+            await app.request("thread/archive", {"threadId": thread_id})
+            events.clear()
+            await runner.serve(app, dry_run=True)
+            self.assertNotIn("wouldRetry", [event for event, _ in events])
+            self.assertEqual(len(self.backend.requests), 1)
 
     async def test_cold_active_goal_resume_is_not_started_twice(self):
         async with Native(self.home) as server, AppServer(f"unix://{server.socket}") as app:
