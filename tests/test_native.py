@@ -158,7 +158,7 @@ class NativeTests(unittest.IsolatedAsyncioTestCase):
     async def terminal(self, app, thread_id):
         for _ in range(200):
             try:
-                current = await snapshot(app, thread_id, inspect_idle=True)
+                current = await snapshot(app, thread_id)
             except RPCError as exc:
                 # A fresh thread's rollout may not yet be registered for paginated reads.
                 if str(exc) != "list_turns is not supported yet":
@@ -317,8 +317,6 @@ class NativeTests(unittest.IsolatedAsyncioTestCase):
         async with Native(self.home) as server, AppServer(f"unix://{server.socket}") as app:
             thread_id, old = await self.agent_block_then_capacity(app)
             before = (await app.request("thread/goal/get", {"threadId": thread_id}))["goal"]
-            result = await recover(app, thread_id, old, resume_blocked_goals=False)
-            self.assertEqual(result, {"outcome": "inactiveGoal", "goalStatus": "blocked"})
         async with Native(self.home) as server, AppServer(f"unix://{server.socket}") as app:
             events = []
             runner = Runner(
@@ -327,15 +325,18 @@ class NativeTests(unittest.IsolatedAsyncioTestCase):
                 emit=lambda event, **fields: events.append((event, fields)),
             )
             await runner.serve(app, dry_run=True)
-            self.assertEqual(
-                events, [("inactiveGoal", {"threadId": thread_id, "goalStatus": "blocked"})]
-            )
-            result = await recover(app, thread_id, old, resume_blocked_goals=False)
-            self.assertEqual(result, {"outcome": "inactiveGoal", "goalStatus": "blocked"})
+            self.assertEqual(events[-1][0], "wouldRetry")
+            self.assertEqual(events[-1][1]["goalStatus"], "blocked")
+            self.assertIsNone(events[-1][1]["goalAction"])
             self.assertEqual((await snapshot(app, thread_id)).status, "notLoaded")
+            result = await recover(app, thread_id, old, resume_blocked_goals=False)
+            self.assertEqual(result["outcome"], "started")
+            final = await self.terminal(app, thread_id)
+            self.assertEqual(final.turn["status"], "completed")
             after = (await app.request("thread/goal/get", {"threadId": thread_id}))["goal"]
-            self.assertEqual(after, before)
-            self.assertEqual(len(self.backend.requests), 2)
+            for field in ["status", "objective", "tokenBudget", "tokensUsed", "createdAt"]:
+                self.assertEqual(after[field], before[field])
+            self.assertEqual(len(self.backend.requests), 3)
 
     async def test_goal_retries_repeated_capacity_failures_until_service_recovers(self):
         self.backend.fail_at = {1, 2}
@@ -362,22 +363,122 @@ class NativeTests(unittest.IsolatedAsyncioTestCase):
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
 
-    async def test_explicitly_paused_and_archived_failed_threads_are_not_recovered(self):
+    async def test_paused_goal_preserved_while_cold_capacity_failure_recovers(self):
         async with Native(self.home) as server, AppServer(f"unix://{server.socket}") as app:
-            thread_id, _ = await self.create_failed(app, goal=True)
+            thread_id, old = await self.create_failed(app, goal=True)
             await app.request("thread/goal/set", {"threadId": thread_id, "status": "paused"})
+            before = (await app.request("thread/goal/get", {"threadId": thread_id}))["goal"]
         async with Native(self.home) as server, AppServer(f"unix://{server.socket}") as app:
             events = []
             runner = Runner(emit=lambda event, **fields: events.append((event, fields)))
             await runner.serve(app, dry_run=True)
-            self.assertIn("inactiveGoal", [event for event, _ in events])
+            self.assertIn("wouldRetry", [event for event, _ in events])
             self.assertEqual((await snapshot(app, thread_id)).status, "notLoaded")
             self.assertEqual(len(self.backend.requests), 1)
-            await app.request("thread/archive", {"threadId": thread_id})
-            events.clear()
-            await runner.serve(app, dry_run=True)
-            self.assertNotIn("wouldRetry", [event for event, _ in events])
+            result = await recover(app, thread_id, old)
+            self.assertEqual(result["outcome"], "started")
+            self.assertEqual((await self.terminal(app, thread_id)).turn["status"], "completed")
+            after = (await app.request("thread/goal/get", {"threadId": thread_id}))["goal"]
+            for field in ["status", "objective", "tokenBudget", "tokensUsed", "createdAt"]:
+                self.assertEqual(after[field], before[field])
+            self.assertEqual(len(self.backend.requests), 2)
+
+    async def test_offline_archive_stops_a_known_pending_failure(self):
+        events = []
+        runner = Runner(delay=100, emit=lambda event, **fields: events.append((event, fields)))
+        async with Native(self.home) as server, AppServer(f"unix://{server.socket}") as app:
+            thread_id, _ = await self.create_failed(app)
+            await runner.inspect(app, thread_id)
+            self.assertIn(thread_id, runner.retries)
+        # Another client archives it while the runner is disconnected. On the
+        # next connection no archive notification has been seen by the runner.
+        async with Native(self.home) as server:
+            async with AppServer(f"unix://{server.socket}") as other:
+                await other.request("thread/archive", {"threadId": thread_id})
+            async with AppServer(f"unix://{server.socket}") as app:
+                self.assertNotIn(thread_id, app.archived)
+                runner.retries[thread_id].due = 0
+                await runner.inspect(app, thread_id)
+                self.assertNotIn(thread_id, runner.retries, events)
+                self.assertEqual(events[-1][0], "outOfScope")
+                self.assertEqual((await snapshot(app, thread_id)).status, "notLoaded")
+                self.assertEqual(len(self.backend.requests), 1)
+
+    async def test_idle_legacy_failure_is_discovered_after_cold_load(self):
+        async with Native(self.home) as server, AppServer(f"unix://{server.socket}") as app:
+            thread_id, _ = await self.create_failed(app, history_mode="legacy")
+        async with Native(self.home) as server, AppServer(f"unix://{server.socket}") as app:
+            await app.request("thread/resume", {"threadId": thread_id, "excludeTurns": True})
+            current = await snapshot(app, thread_id)
+            self.assertEqual(current.status, "idle")
+            self.assertTrue(current.capacity_failed)
+            runner = Runner(delay=0.001)
+            await runner.inspect(app, thread_id)
+            runner.retries[thread_id].due = 0
+            await runner.inspect(app, thread_id)
+            self.assertEqual((await self.terminal(app, thread_id)).turn["status"], "completed")
+            self.assertEqual(len(self.backend.requests), 2)
+
+    async def test_read_timeout_after_real_cold_load_does_not_disable_recovery(self):
+        async with Native(self.home) as server, AppServer(f"unix://{server.socket}") as app:
+            thread_id, _ = await self.create_failed(app)
+        async with Native(self.home) as server, AppServer(f"unix://{server.socket}") as app:
+            original = app.request
+            loaded = False
+            loads = 0
+
+            async def request(method, params):
+                nonlocal loaded, loads
+                if method == "thread/goal/get" and loaded:
+                    raise TimeoutError("injected read timeout after acknowledged load")
+                result = await original(method, params)
+                if method == "thread/resume":
+                    loaded, loads = True, loads + 1
+                return result
+
+            app.request = request
+            runner = Runner(delay=0.001)
+            await runner.inspect(app, thread_id)
+            runner.retries[thread_id].due = 0
+            await runner.inspect(app, thread_id)
+            self.assertFalse(runner.retries[thread_id].blocked)
+            self.assertEqual((await snapshot(app, thread_id)).status, "idle")
+            app.request = original
+            runner.retries[thread_id].due = 0
+            await runner.inspect(app, thread_id)
+            self.assertEqual((await self.terminal(app, thread_id)).turn["status"], "completed")
+            self.assertEqual(loads, 1)
+            self.assertEqual(len(self.backend.requests), 2)
+
+    async def test_lost_accepted_turn_reconciles_with_cold_state_after_restart(self):
+        runner = Runner(delay=0.001)
+        async with Native(self.home) as server, AppServer(f"unix://{server.socket}") as app:
+            thread_id, old = await self.create_failed(app)
+            original = app.request
+
+            async def request(method, params):
+                if method == "turn/start":
+                    # Fault injection: simulate acceptance followed by loss of
+                    # the new turn before it reached durable history. Other RPCs
+                    # and the restart use a real isolated Codex server.
+                    return {"turn": {"id": "accepted-but-unpersisted"}}
+                return await original(method, params)
+
+            app.request = request
+            await runner.inspect(app, thread_id)
+            runner.retries[thread_id].due = 0
+            await runner.inspect(app, thread_id)
+            self.assertEqual(runner.retries[thread_id].submitted, "accepted-but-unpersisted")
+            await runner.inspect(app, thread_id)
             self.assertEqual(len(self.backend.requests), 1)
+        async with Native(self.home) as server, AppServer(f"unix://{server.socket}") as app:
+            current = await snapshot(app, thread_id)
+            self.assertEqual((current.status, current.turn_id), ("notLoaded", old))
+            await runner.inspect(app, thread_id)
+            runner.retries[thread_id].due = 0
+            await runner.inspect(app, thread_id)
+            self.assertEqual((await self.terminal(app, thread_id)).turn["status"], "completed")
+            self.assertEqual(len(self.backend.requests), 2)
 
     async def test_cold_active_goal_resume_is_not_started_twice(self):
         async with Native(self.home) as server, AppServer(f"unix://{server.socket}") as app:
