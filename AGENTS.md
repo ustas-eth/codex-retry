@@ -29,6 +29,8 @@ establish eligibility and should be reported once, not repeatedly probed.
 Tests use synthetic threads, temporary state, and local mock servers. Real Codex
 tests must use an isolated home and local model endpoint, not live threads or
 account credentials. Keep private paths, logs, and identifiers out of commits.
+Public notes describe user-visible changes, without host-specific setup or
+test-run inventories.
 
 Run `uv run python -m unittest discover -s tests -v`, `uvx ruff check .`,
 `uvx ruff format --check .`, and `git diff --check`.

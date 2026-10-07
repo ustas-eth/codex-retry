@@ -150,13 +150,3 @@ a temporary Codex home and a local mock model, without account credentials.
 ```sh
 CODEX_RETRY_TEST_BINARY=/path/to/codex uv run python -m unittest discover -s tests -v
 ```
-
-Native recovery is tested against Codex 0.159.1, including legacy and paginated
-history, loaded and cold threads, and goal continuation.
-The cold-goal test restarts the server after a capacity error and verifies
-discovery, sustained automatic turns, preserved usage, and eventual budget stop.
-Additional tests cover stopped goals, idle legacy failures, offline archiving,
-post-load read timeouts, and a fault-injected lost acceptance across a restart.
-Responsiveness tests block background reads while a retry proceeds, verify
-bounded concurrency and final preflight checks, preserve notices arriving
-during discovery, and quarantine controls interrupted during shutdown.
