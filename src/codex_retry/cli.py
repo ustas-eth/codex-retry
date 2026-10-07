@@ -54,7 +54,7 @@ def parser():
         "--delay",
         type=positive_float,
         default=5,
-        help="first retry delay; backoff is capped at 60s (default: 5)",
+        help="first retry backoff, before inspection; capped at 60s (default: 5)",
     )
     result.add_argument(
         "--max-retries",
