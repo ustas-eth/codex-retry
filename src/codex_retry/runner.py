@@ -7,7 +7,7 @@ import math
 import time
 from dataclasses import dataclass
 
-from .recovery import ControlStopped, goal, recover, snapshot
+from .recovery import ControlStopped, HistoryUnavailable, RecoveryTiming, goal, recover, snapshot
 from .rpc import RPCError
 
 
@@ -91,6 +91,7 @@ class Runner:
         self.resume_blocked_goals = resume_blocked_goals
         self.retries = {}
         self.legacy_cache = {}
+        self.unsupported = set()
         self.slots = asyncio.Semaphore(2)
 
     def defer_retry(self, pending):
@@ -110,22 +111,36 @@ class Runner:
 
     async def inspect(self, app, thread_id, *, dry_run=False):
         async with self.slots:
+            started = asyncio.get_running_loop().time()
+            timing = RecoveryTiming()
+            if thread_id in self.unsupported:
+                return
             if thread_id in app.archived:
                 self.retries.pop(thread_id, None)
                 self.legacy_cache.pop(thread_id, None)
                 return
             pending = self.retries.get(thread_id)
+            late_ms = max(0, started - pending.due) * 1000 if pending else 0
             if pending is not None:
                 self.legacy_cache.pop(thread_id, None)
             try:
                 current = await snapshot(
-                    app, thread_id, legacy_cache=self.legacy_cache if pending is None else None
+                    app,
+                    thread_id,
+                    legacy_cache=self.legacy_cache if pending is None else None,
+                    timing=timing,
                 )
+            except HistoryUnavailable as exc:
+                self.unsupported.add(thread_id)
+                self.retries.pop(thread_id, None)
+                self.legacy_cache.pop(thread_id, None)
+                self.emit("unsupported", threadId=thread_id, message=str(exc))
+                return
             except (RuntimeError, TimeoutError, KeyError, TypeError) as exc:
                 if self.unavailable(thread_id, exc):
                     return
                 self.defer_retry(pending)
-                self.emit("inspectError", threadId=thread_id, message=str(exc))
+                self.emit("inspectError", threadId=thread_id, message=str(exc), **timing.fields())
                 return False
             if current.status == "active":
                 self.defer_retry(pending)
@@ -164,7 +179,13 @@ class Runner:
             if pending is None:
                 self.legacy_cache.pop(thread_id, None)
                 pending = self.retries[thread_id] = Retry(current.turn_id, now + self.delay)
-                self.emit("scheduled", threadId=thread_id, turnId=current.turn_id, delay=self.delay)
+                self.emit(
+                    "scheduled",
+                    threadId=thread_id,
+                    turnId=current.turn_id,
+                    delay=self.delay,
+                    **timing.fields(),
+                )
             elif current.turn_id != pending.turn_id:
                 # A newly observed capacity failure is safe to retry; the old submission is settled.
                 pending.turn_id = current.turn_id
@@ -175,6 +196,7 @@ class Runner:
                     threadId=thread_id,
                     turnId=current.turn_id,
                     delay=round(pending.due - now, 2),
+                    **timing.fields(),
                 )
             elif pending.accepted and current.status == "notLoaded":
                 # An acknowledged start/continuation cannot still be running in
@@ -197,24 +219,33 @@ class Runner:
                     thread_id,
                     pending.turn_id,
                     resume_blocked_goals=self.resume_blocked_goals,
+                    current=current,
+                    timing=timing,
                 )
             except ControlStopped as exc:
                 pending.blocked = True
                 pending.accepted = exc.accepted
                 if exc.accepted:
                     pending.attempts += 1
-                self.emit("recoveryStopped", threadId=thread_id, message=str(exc))
+                self.emit(
+                    "recoveryStopped", threadId=thread_id, message=str(exc), **timing.fields()
+                )
                 return
             except (RuntimeError, TimeoutError, KeyError, TypeError) as exc:
                 if self.unavailable(thread_id, exc):
                     return
-                pending.due = now + 30
-                self.emit("recoveryDeferred", threadId=thread_id, message=str(exc))
+                pending.due = asyncio.get_running_loop().time() + 30
+                self.emit(
+                    "recoveryDeferred", threadId=thread_id, message=str(exc), **timing.fields()
+                )
                 return
             self.emit(
                 result["outcome"],
                 threadId=thread_id,
                 **{key: value for key, value in result.items() if key != "outcome"},
+                lateMs=round(late_ms, 1),
+                recoveryMs=round((asyncio.get_running_loop().time() - started) * 1000, 1),
+                **timing.fields(),
             )
             if result["outcome"] in {"started", "resumed"}:
                 pending.attempts += 1
@@ -222,68 +253,117 @@ class Runner:
                 pending.accepted = True
             elif result["outcome"] == "changed":
                 pending.blocked = False
-                pending.due = now + 30
+                pending.due = asyncio.get_running_loop().time() + 30
 
     async def serve(self, app, *, dry_run=False, scan_interval=30):
         self.legacy_cache.clear()
+        self.unsupported.clear()
         known, saved_seen, next_scan = set(), {}, 0
-        while True:
-            now = asyncio.get_running_loop().time()
-            if now >= next_scan:
-                loaded = await loaded_threads(app)
-                targets = loaded | set(self.retries)
-                try:
-                    saved = await recent_threads(app, time.time() - self.lookback_hours * 3600)
-                except (RuntimeError, TimeoutError, KeyError, TypeError) as exc:
-                    self.emit("discoveryError", message=str(exc))
-                    saved = saved_seen
-                targets |= {
-                    thread_id
-                    for thread_id, stamp in saved.items()
-                    if saved_seen.get(thread_id) != stamp
-                }
-                saved_seen = saved
-                known = loaded | set(saved) | set(self.retries)
-                for thread_id in set(self.legacy_cache) - known:
-                    self.legacy_cache.pop(thread_id, None)
-                next_scan = now + scan_interval
-            else:
-                targets = app.dirty & known
-                if app.dirty - known:
+        queued, running = set(), {}
+        scanned = False
+        try:
+            while True:
+                # Drain notifications before any awaits so notices arriving
+                # during discovery are retained for the next iteration.
+                notices = set(app.dirty)
+                app.dirty.difference_update(notices)
+                app.changed.clear()
+                for thread_id, task in list(running.items()):
+                    if task.done():
+                        del running[thread_id]
+                        # A notice can arrive before the old read populates
+                        # its cache. Its queued follow-up must not reuse that
+                        # late cache entry, even within the same second.
+                        if thread_id in queued:
+                            self.legacy_cache.pop(thread_id, None)
+                        if task.result() is False:
+                            saved_seen.pop(thread_id, None)
+                now = asyncio.get_running_loop().time()
+                if not scanned or (not dry_run and now >= next_scan):
                     loaded = await loaded_threads(app)
-                    targets |= app.dirty & loaded
+                    queued |= loaded | set(self.retries)
+                    try:
+                        saved = await recent_threads(app, time.time() - self.lookback_hours * 3600)
+                    except (RuntimeError, TimeoutError, KeyError, TypeError) as exc:
+                        self.emit("discoveryError", message=str(exc))
+                        saved = saved_seen
+                    queued |= {
+                        thread_id
+                        for thread_id, stamp in saved.items()
+                        if saved_seen.get(thread_id) != stamp
+                    }
+                    saved_seen = saved
+                    known = loaded | set(saved) | set(self.retries)
+                    for thread_id in set(self.legacy_cache) - known:
+                        self.legacy_cache.pop(thread_id, None)
+                    self.unsupported.intersection_update(known)
+                    queued.intersection_update(known)
+                    next_scan = asyncio.get_running_loop().time() + scan_interval
+                    scanned = True
+                queued |= notices & known
+                if notices - known:
+                    loaded = await loaded_threads(app)
+                    queued |= notices & loaded
                     known |= loaded
-            targets |= {
-                thread_id
-                for thread_id, retry in self.retries.items()
-                if not retry.blocked and retry.submitted is None and retry.due <= now
-            }
-            for thread_id in app.dirty:
-                self.legacy_cache.pop(thread_id, None)
-            app.dirty.clear()
-            app.changed.clear()
-            targets -= app.archived
-            for thread_id in app.archived:
-                if self.retries.pop(thread_id, None) is not None:
-                    self.emit("archived", threadId=thread_id)
-            if app.reader.done():
-                raise RuntimeError("app-server connection closed")
-            ordered = sorted(targets)
-            results = await asyncio.gather(
-                *(self.inspect(app, thread_id, dry_run=dry_run) for thread_id in ordered)
-            )
-            for thread_id, inspected in zip(ordered, results):
-                if inspected is False:
-                    saved_seen.pop(thread_id, None)
-            if dry_run:
-                return
-            deadlines = [next_scan] + [
-                retry.due
-                for retry in self.retries.values()
-                if not retry.blocked and retry.submitted is None
-            ]
-            wait = max(0.05, min(deadlines) - asyncio.get_running_loop().time())
-            try:
-                await asyncio.wait_for(app.changed.wait(), timeout=wait)
-            except TimeoutError:
-                pass
+                for thread_id in notices:
+                    self.legacy_cache.pop(thread_id, None)
+                now = asyncio.get_running_loop().time()
+                due = {
+                    thread_id
+                    for thread_id, retry in self.retries.items()
+                    if not retry.blocked and retry.submitted is None and retry.due <= now
+                }
+                if not dry_run:
+                    queued |= due
+                queued -= app.archived | self.unsupported
+                for thread_id in app.archived:
+                    if self.retries.pop(thread_id, None) is not None:
+                        self.emit("archived", threadId=thread_id)
+                if app.reader.done():
+                    raise RuntimeError("app-server connection closed")
+                # Two reads maximum, one task per thread. Reserve a slot while
+                # a retry is waiting; background scans cannot fill it first.
+                waiting_retry = not dry_run and any(
+                    not retry.blocked and retry.submitted is None for retry in self.retries.values()
+                )
+                background = sum(thread_id not in due for thread_id in running)
+                ordered = sorted(
+                    queued - running.keys(),
+                    key=lambda thread_id: (
+                        thread_id not in due,
+                        self.retries[thread_id].due if thread_id in due else 0,
+                        thread_id,
+                    ),
+                )
+                for thread_id in ordered:
+                    if len(running) == 2:
+                        break
+                    if thread_id not in due:
+                        if waiting_retry and background >= 1:
+                            continue
+                        background += 1
+                    queued.remove(thread_id)
+                    task = asyncio.create_task(self.inspect(app, thread_id, dry_run=dry_run))
+                    running[thread_id] = task
+                    task.add_done_callback(lambda _: app.changed.set())
+                if dry_run and not queued and not running:
+                    return
+                deadlines = [next_scan] if not dry_run else []
+                deadlines += [
+                    retry.due
+                    for thread_id, retry in self.retries.items()
+                    if not retry.blocked
+                    and retry.submitted is None
+                    and thread_id not in running
+                    and retry.due > now
+                    and not dry_run
+                ]
+                wait = max(0.01, min(deadlines) - now) if deadlines else None
+                try:
+                    await asyncio.wait_for(app.changed.wait(), timeout=wait)
+                except TimeoutError:
+                    pass
+        finally:
+            for task in running.values():
+                task.cancel()
+            await asyncio.gather(*running.values(), return_exceptions=True)

@@ -21,6 +21,10 @@ Never replay an uncertain control request. An acknowledged retry can be
 reconciled if the thread is unloaded and its new turn did not persist.
 The lookback window limits discovery, not an already-known retry's lifetime.
 Never broaden permissions or retry policy/usage-limit failures.
+Keep retry deadlines independent of slow fleet scans, with bounded concurrency
+and one inspection per thread. Cached history must never authorize recovery;
+retain a fresh final preflight. Ephemeral threads have no persisted history to
+establish eligibility and should be reported once, not repeatedly probed.
 
 Tests use synthetic threads, temporary state, and local mock servers. Real Codex
 tests must use an isolated home and local model endpoint, not live threads or

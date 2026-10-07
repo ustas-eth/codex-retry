@@ -40,8 +40,11 @@ last 24 hours. It can be started after a failure, including after the thread
 was unloaded or the server restarted. The time window limits discovery;
 once a failure is queued, it stays tracked until resolved or archived.
 Notifications make it react promptly; a 30-second scan catches missed events
-and newly discovered work. It retries
-after 5 seconds, then backs off to a maximum of 60 seconds until capacity returns.
+and newly discovered work. The first retry is eligible after 5 seconds, then
+backoff grows to a maximum of 60 seconds until capacity returns. Inspection and
+recovery add to that delay. Due retries take priority over background scans;
+at most two inspections run concurrently, with one slot reserved while a retry
+is waiting and only one inspection per thread.
 Optional controls:
 
 ```sh
@@ -90,7 +93,9 @@ a duplicate start. With no stopped goal to reactivate, it uses `turn/start`
 with empty input when needed, as in `codex-threadctl wake --resume`. It sends no
 configuration overrides. Cold loading follows Codex's own resume behavior and
 persisted settings; normal account limits and tool permissions still apply.
-Parent-owned v2 children may reject direct control.
+Parent-owned v2 children may reject direct control. Ephemeral threads expose no
+persisted turn history, so the runner skips them and reports `unsupported`
+once per connection rather than repeatedly querying an unavailable endpoint.
 
 Read failures defer recovery. Ambiguous control results suspend retries for
 that exact failed turn; a later observed capacity failure can be retried.
@@ -105,15 +110,29 @@ starts a fresh scan. Server disconnects reconnect automatically.
 Ctrl+C stops the runner, not workers or their goals.
 
 Logs contain lifecycle events rather than conversation contents; `--json`
-emits one object per line. Run it in tmux or your service manager to keep it
-alive. `--dry-run` works beside an existing runner, exits after one read-only
-scan, and reports eligible retries, current goal status, and planned goal
-reactivation under the selected policy. Current history uses a one-turn
-metadata read. Legacy histories require a full read, including idle threads:
-idle status alone does not prove success. Unchanged idle legacy reads are
-cached for up to 60 seconds and invalidated by thread notifications.
-Very large histories can exceed the RPC timeout or 16 MiB response limit, in
-which case the failure is logged and left alone.
+emits one object per line. Recovery results include timing fields:
+
+| Field | Meaning |
+| --- | --- |
+| `lateMs` | Time past the retry deadline when its inspection began. |
+| `recoveryMs` | Total time spent inspecting and recovering in that attempt. |
+| `historyMs` / `historyReads` | Time waiting for history requests and their count. |
+| `controlMs` | Time waiting for resume, goal activation, or turn-start requests. |
+
+History and control times are parts of `recoveryMs`, not additional delays.
+Run the runner in tmux or your service manager to keep it alive. `--dry-run`
+works beside an existing runner, exits after one read-only scan, and reports
+eligible retries, current goal status, and planned goal reactivation under
+the selected policy.
+
+History reads request only the latest turn's metadata. For legacy histories,
+Codex can still reconstruct the full rollout before returning that small page.
+Recovery reuses its initial inspection and retains a fresh check before changing
+the thread. Unchanged idle legacy reads are cached for up to 60 seconds and
+invalidated by thread notifications; pending retries always read fresh history.
+Idle status alone does not prove success. Older servers without turn pagination
+require full-history responses, which can exceed the 16 MiB response limit.
+History timeouts and other read failures are logged and defer recovery.
 
 The [Codex app-server documentation](https://developers.openai.com/codex/app-server)
 describes server setup. Recovery semantics are adapted from
@@ -138,3 +157,6 @@ The cold-goal test restarts the server after a capacity error and verifies
 discovery, sustained automatic turns, preserved usage, and eventual budget stop.
 Additional tests cover stopped goals, idle legacy failures, offline archiving,
 post-load read timeouts, and a fault-injected lost acceptance across a restart.
+Responsiveness tests block background reads while a retry proceeds, verify
+bounded concurrency and final preflight checks, preserve notices arriving
+during discovery, and quarantine controls interrupted during shutdown.

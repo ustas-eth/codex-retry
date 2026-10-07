@@ -508,3 +508,44 @@ class NativeTests(unittest.IsolatedAsyncioTestCase):
             )["thread"]
             self.assertEqual(thread["historyMode"], "legacy")
             self.assertEqual(len(self.backend.requests), 2)
+
+    async def test_supported_legacy_history_is_cached_after_success(self):
+        async with Native(self.home) as server, AppServer(f"unix://{server.socket}") as app:
+            thread_id, old = await self.create_failed(app, history_mode="legacy")
+            await recover(app, thread_id, old)
+            await self.terminal(app, thread_id)
+            calls = []
+            original = app.request
+
+            async def request(method, params):
+                calls.append(method)
+                return await original(method, params)
+
+            app.request = request
+            runner = Runner()
+            await runner.inspect(app, thread_id)
+            self.assertEqual(calls.count("thread/turns/list"), 1)
+            calls.clear()
+            await runner.inspect(app, thread_id)
+            self.assertEqual(calls, ["thread/read"])
+            self.assertEqual(len(self.backend.requests), 2)
+
+    async def test_ephemeral_thread_is_skipped_without_control(self):
+        async with Native(self.home) as server, AppServer(f"unix://{server.socket}") as app:
+            result = await app.request("thread/start", {"cwd": str(self.home), "ephemeral": True})
+            thread_id = result["thread"]["id"]
+            self.assertTrue(result["thread"]["ephemeral"])
+            calls, events = [], []
+            original = app.request
+
+            async def request(method, params):
+                calls.append(method)
+                return await original(method, params)
+
+            app.request = request
+            runner = Runner(emit=lambda event, **fields: events.append((event, fields)))
+            await runner.inspect(app, thread_id)
+            await runner.inspect(app, thread_id)
+            self.assertEqual(calls, ["thread/read"])
+            self.assertEqual([event for event, _ in events], ["unsupported"])
+            self.assertEqual(len(self.backend.requests), 0)
